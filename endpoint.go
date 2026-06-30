@@ -9,11 +9,13 @@ import (
 	"sync"
 	"time"
 
+	"github.com/tmc/go-iroh/dns"
 	"github.com/tmc/go-iroh/endpointticket"
 	"github.com/tmc/go-iroh/gossip"
 	"github.com/tmc/go-iroh/iroh"
 	"github.com/tmc/go-iroh/key"
 	"github.com/tmc/go-iroh/netaddr"
+	"github.com/tmc/go-iroh/relay"
 )
 
 // ErrInvalid reports invalid endpoint input or state.
@@ -30,12 +32,54 @@ var ErrInvalid = errors.New("irohmesh: invalid")
 // BindAddr is an "ip:port" address; an empty value uses the go-iroh default
 // (an ephemeral port on all interfaces).
 //
-// The zero Config is usable: it binds an ephemeral endpoint with a generated
-// identity.
+// Relay and Pkarr enable global reachability and default to false, so a Config
+// that leaves them unset binds a gossip/LAN endpoint exactly as before. With
+// Pkarr set, [Bind] registers a pkarr publisher and resolver on the endpoint's
+// lookup services and starts republishing the node's own address as it changes,
+// so [Endpoint.ResolveAddr] and [Endpoint.ConnectID] then reach a peer by bare
+// EndpointID across the internet. With Relay set, relay mode is enabled so NAT'd
+// peers connect (relay first, then a hole-punched direct upgrade); a globally
+// reachable node sets both.
+//
+// PkarrRelayURL overrides the pkarr relay to publish to and resolve from; an
+// empty value uses the number0 production relay. PublishAllAddrs publishes
+// direct IP addresses in addition to relay addresses; the default publishes
+// relay addresses only (go-iroh's RelayOnlyFilter), enough for reachability and
+// leaking fewer addresses. Both apply only when Pkarr is set.
+//
+// The zero Config is usable: it binds an ephemeral gossip/LAN endpoint with a
+// generated identity.
 type Config struct {
 	BindAddr  string
 	SecretKey string
 	Identity  ed25519.PrivateKey
+
+	Relay           bool
+	Pkarr           bool
+	PkarrRelayURL   string
+	PublishAllAddrs bool
+}
+
+// secretKey resolves the endpoint's signing key from the config, in the same
+// precedence Bind uses: Identity, then SecretKey. It reports whether a key was
+// set, so Bind can decide whether to generate one (pkarr needs an explicit key,
+// while a plain endpoint may let go-iroh generate an ephemeral one).
+func (cfg Config) secretKey() (sk key.SecretKey, set bool, err error) {
+	switch {
+	case len(cfg.Identity) == ed25519.PrivateKeySize:
+		sk, err = key.SecretKeyFromEd25519(cfg.Identity)
+		if err != nil {
+			return key.SecretKey{}, false, fmt.Errorf("%w: identity key: %v", ErrInvalid, err)
+		}
+		return sk, true, nil
+	case cfg.SecretKey != "":
+		sk, err = key.ParseSecretKey(cfg.SecretKey)
+		if err != nil {
+			return key.SecretKey{}, false, fmt.Errorf("%w: secret key: %v", ErrInvalid, err)
+		}
+		return sk, true, nil
+	}
+	return key.SecretKey{}, false, nil
 }
 
 // Endpoint is a bound go-iroh endpoint. After [Endpoint.Serve] it also owns the
@@ -46,6 +90,9 @@ type Endpoint struct {
 	router *iroh.Router                // nil until Serve; owns the accept loop and endpoint close
 	lookup *iroh.AddressLookupServices // address resolvers (gossip, pkarr, dns)
 
+	publisher *iroh.PkarrPublisher // non-nil when Config.Pkarr is set; closed by Close
+	cancel    context.CancelFunc   // stops the pkarr publish loop; nil unless publishing
+
 	gossipOnce sync.Once
 	gossip     *gossip.Gossip // lazily created; shared by Serve, discovery, Subscribe
 }
@@ -55,19 +102,22 @@ type Endpoint struct {
 // must not already be listening. [Endpoint.Connect] (the dial path) works on a
 // bound endpoint with no Serve. The caller owns [Endpoint.Close].
 func Bind(ctx context.Context, cfg Config) (*Endpoint, error) {
+	sk, haveKey, err := cfg.secretKey()
+	if err != nil {
+		return nil, err
+	}
+	// Pkarr needs an explicit key so the publisher and the endpoint share one
+	// identity (and the published EndpointID is stable). Generate one when the
+	// caller gave none; a plain endpoint may still let go-iroh generate its own.
+	if cfg.Pkarr && !haveKey {
+		if sk, err = key.GenerateSecretKey(); err != nil {
+			return nil, fmt.Errorf("%w: generate identity: %v", ErrInvalid, err)
+		}
+		haveKey = true
+	}
+
 	var opts []iroh.Option
-	switch {
-	case len(cfg.Identity) == ed25519.PrivateKeySize:
-		sk, err := key.SecretKeyFromEd25519(cfg.Identity)
-		if err != nil {
-			return nil, fmt.Errorf("%w: identity key: %v", ErrInvalid, err)
-		}
-		opts = append(opts, iroh.WithSecretKey(sk))
-	case cfg.SecretKey != "":
-		sk, err := key.ParseSecretKey(cfg.SecretKey)
-		if err != nil {
-			return nil, fmt.Errorf("%w: secret key: %v", ErrInvalid, err)
-		}
+	if haveKey {
 		opts = append(opts, iroh.WithSecretKey(sk))
 	}
 	if cfg.BindAddr != "" {
@@ -77,18 +127,95 @@ func Bind(ctx context.Context, cfg Config) (*Endpoint, error) {
 		}
 		opts = append(opts, iroh.WithBindAddr(addr))
 	}
+	if cfg.Relay {
+		opts = append(opts, iroh.WithRelayMode(relay.ModeDefault()))
+	}
 	// Own the address-lookup registry so the endpoint can resolve a bare
 	// EndpointID after bind (see Endpoint.ResolveAddr/ConnectID). A
 	// gossip-backed Discovery registers itself here as a resolver, and pkarr or
 	// DNS services can be added by the caller.
 	lookup := new(iroh.AddressLookupServices)
 	opts = append(opts, iroh.WithAddressLookup(lookup))
+
+	// Register the pkarr publisher and resolver on the same lookup registry
+	// before binding, so a bare-id dial through ResolveAddr/ConnectID resolves
+	// globally. The publisher is built from the resolved key above.
+	var publisher *iroh.PkarrPublisher
+	if cfg.Pkarr {
+		if publisher, err = newPkarrPublisher(sk, cfg); err != nil {
+			return nil, err
+		}
+		resolver, err := newPkarrResolver(cfg)
+		if err != nil {
+			publisher.Close()
+			return nil, err
+		}
+		lookup.AddPublisher(publisher)
+		lookup.AddResolver(resolver)
+	}
+
 	ep, err := iroh.Bind(ctx, opts...)
 	if err != nil {
+		if publisher != nil {
+			publisher.Close()
+		}
 		return nil, fmt.Errorf("bind irohmesh endpoint: %w", err)
 	}
-	return &Endpoint{ep: ep, lookup: lookup}, nil
+
+	e := &Endpoint{ep: ep, lookup: lookup, publisher: publisher}
+	if cfg.Pkarr {
+		// Drive self-publishing: the endpoint does not publish its own address,
+		// so republish it to the lookup services whenever it changes. The loop
+		// outlives ctx (a bind-scoped context) and is stopped by Close.
+		loopCtx, cancel := context.WithCancel(context.Background())
+		e.cancel = cancel
+		go e.publishLoop(loopCtx)
+	}
+	return e, nil
 }
+
+// newPkarrPublisher builds the pkarr publisher for cfg's key, honoring the relay
+// URL and address-filter options.
+func newPkarrPublisher(sk key.SecretKey, cfg Config) (*iroh.PkarrPublisher, error) {
+	pubCfg := &iroh.PkarrPublisherConfig{}
+	if cfg.PublishAllAddrs {
+		pubCfg.AddrFilter = publishAllFilter
+	}
+	var (
+		publisher *iroh.PkarrPublisher
+		err       error
+	)
+	if cfg.PkarrRelayURL != "" {
+		publisher, err = iroh.NewPkarrPublisher(sk, cfg.PkarrRelayURL, pubCfg)
+	} else {
+		publisher, err = iroh.N0PkarrPublisher(sk, pubCfg)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("%w: pkarr publisher: %v", ErrInvalid, err)
+	}
+	return publisher, nil
+}
+
+// newPkarrResolver builds the pkarr resolver, honoring the relay URL override.
+func newPkarrResolver(cfg Config) (*iroh.PkarrResolver, error) {
+	var (
+		resolver *iroh.PkarrResolver
+		err      error
+	)
+	if cfg.PkarrRelayURL != "" {
+		resolver, err = iroh.NewPkarrResolver(cfg.PkarrRelayURL, nil)
+	} else {
+		resolver, err = iroh.N0PkarrResolver(nil)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("%w: pkarr resolver: %v", ErrInvalid, err)
+	}
+	return resolver, nil
+}
+
+// publishAllFilter publishes every transport address unchanged, overriding the
+// relay-only default so direct IPs are published too.
+func publishAllFilter(addrs []netaddr.TransportAddr) []netaddr.TransportAddr { return addrs }
 
 // ID returns the bound endpoint's identity key.
 func (e *Endpoint) ID() key.EndpointID { return e.ep.ID() }
@@ -96,6 +223,26 @@ func (e *Endpoint) ID() key.EndpointID { return e.ep.ID() }
 // Addr returns the endpoint's advertised address (identity plus any known
 // transport addresses), the form a peer dials.
 func (e *Endpoint) Addr() netaddr.EndpointAddr { return e.ep.Addr() }
+
+// WaitOnline blocks until the endpoint has registered with a relay, so its
+// published address carries a reachable relay URL, then publishes that complete
+// address immediately rather than waiting for the next address change. A node
+// that advertises its EndpointID for global discovery should wait for this
+// first: until it is online, a remote peer resolving the id gets an address with
+// no relay and cannot connect. It returns ctx.Err() if ctx is done first, and
+// [ErrInvalid] on an endpoint bound without Config.Pkarr (nothing publishes).
+func (e *Endpoint) WaitOnline(ctx context.Context) error {
+	if e.publisher == nil {
+		return fmt.Errorf("%w: endpoint not bound for pkarr publishing", ErrInvalid)
+	}
+	if err := e.ep.Online(ctx); err != nil {
+		return fmt.Errorf("endpoint online: %w", err)
+	}
+	if addr := e.ep.Addr(); !addr.IsEmpty() {
+		e.lookup.Publish(dns.EndpointDataFromAddr(addr))
+	}
+	return nil
+}
 
 // LocalAddr returns the endpoint's bound UDP address. Combined with [Endpoint.ID]
 // via netaddr.NewEndpointAddr(id).WithIP(localAddr), it forms a dialable seed
@@ -257,15 +404,41 @@ func (e *Endpoint) Subscribe(ctx context.Context, topic gossip.TopicID, bootstra
 	return t, nil
 }
 
-// Close shuts the endpoint down. After Serve it routes through router.Shutdown,
-// which cancels the accept loop, runs handler Shutdown hooks, and closes the
-// endpoint. Before Serve it closes the endpoint directly. Shutdown is
+// publishLoop republishes the endpoint's own address to the lookup services
+// whenever it changes; the endpoint does not self-publish. WatchAddr delivers
+// the current value first, then each change, until ctx is cancelled by Close.
+func (e *Endpoint) publishLoop(ctx context.Context) {
+	for addr := range e.ep.WatchAddr().Stream(ctx) {
+		if addr.IsEmpty() {
+			continue
+		}
+		e.lookup.Publish(dns.EndpointDataFromAddr(addr))
+	}
+}
+
+// Close shuts the endpoint down. It first stops the pkarr publish loop and
+// publisher when Config.Pkarr was set, then shuts the transport: after Serve
+// through router.Shutdown (which cancels the accept loop, runs handler Shutdown
+// hooks, and closes the endpoint), otherwise the endpoint directly. Shutdown is
 // idempotent, so a redundant Close is safe.
 func (e *Endpoint) Close() error {
+	if e.cancel != nil {
+		e.cancel()
+	}
+	var perr error
+	if e.publisher != nil {
+		perr = e.publisher.Close()
+	}
+	var serr error
 	if e.router != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		return e.router.Shutdown(ctx)
+		serr = e.router.Shutdown(ctx)
+	} else {
+		serr = e.ep.Shutdown(context.Background())
 	}
-	return e.ep.Shutdown(context.Background())
+	if serr != nil {
+		return serr
+	}
+	return perr
 }
