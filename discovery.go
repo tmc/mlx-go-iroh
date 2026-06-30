@@ -53,7 +53,7 @@ type gossipDiscovery struct {
 // services, so [Endpoint.ResolveAddr] and [Endpoint.ConnectID] can dial a peer
 // known only by id once the swarm has learned its address.
 func NewGossipDiscovery(ep *Endpoint, topic gossip.TopicID, bootstrap []netaddr.EndpointAddr) Discovery {
-	g := gossip.NewGossip(ep.ep)
+	g := ep.gossipProto()
 	d := gossip.New(ep.ep.ID(), gossip.WithGossip(g, topic, bootstrap))
 	ep.lookup.AddResolver(d)
 	return &gossipDiscovery{d: d, g: g}
@@ -65,15 +65,4 @@ func (g *gossipDiscovery) Publish(data dns.EndpointData) { g.d.Publish(data) }
 
 func (g *gossipDiscovery) Resolve(ctx context.Context, id key.EndpointID) iter.Seq2[iroh.Item, error] {
 	return g.d.Resolve(ctx, id)
-}
-
-// gossipHandler returns the iroh handler a gossip-backed [Discovery] registers
-// on the shared router, for [Endpoint.Serve]. A nil or non-gossip Discovery
-// yields ok=false (no gossip ALPN registered).
-func gossipHandler(disc Discovery) (iroh.ProtocolHandler, bool) {
-	gd, ok := disc.(*gossipDiscovery)
-	if !ok {
-		return nil, false
-	}
-	return gd.g.Handler(), true
 }

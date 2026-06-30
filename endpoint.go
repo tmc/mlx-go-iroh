@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"sync"
 	"time"
 
 	"github.com/tmc/go-iroh/endpointticket"
@@ -44,6 +45,9 @@ type Endpoint struct {
 	ep     *iroh.Endpoint
 	router *iroh.Router                // nil until Serve; owns the accept loop and endpoint close
 	lookup *iroh.AddressLookupServices // address resolvers (gossip, pkarr, dns)
+
+	gossipOnce sync.Once
+	gossip     *gossip.Gossip // lazily created; shared by Serve, discovery, Subscribe
 }
 
 // Bind validates cfg and binds a go-iroh endpoint WITHOUT registering ALPNs:
@@ -93,6 +97,17 @@ func (e *Endpoint) ID() key.EndpointID { return e.ep.ID() }
 // transport addresses), the form a peer dials.
 func (e *Endpoint) Addr() netaddr.EndpointAddr { return e.ep.Addr() }
 
+// LocalAddr returns the endpoint's bound UDP address. Combined with [Endpoint.ID]
+// via netaddr.NewEndpointAddr(id).WithIP(localAddr), it forms a dialable seed
+// address for a peer on a known host — the loopback and seed-list case.
+func (e *Endpoint) LocalAddr() netip.AddrPort { return e.ep.LocalAddr() }
+
+// DialableAddr returns this endpoint's id paired with its bound local address, a
+// dialable seed a peer can bootstrap from without discovery.
+func (e *Endpoint) DialableAddr() netaddr.EndpointAddr {
+	return netaddr.NewEndpointAddr(e.ep.ID()).WithIP(e.ep.LocalAddr())
+}
+
 // Ticket returns an endpointticket-encoded address for this endpoint at addr,
 // so a connector can dial it without discovery. Used to point one endpoint at
 // another on a known address (e.g. a loopback test or a seed list).
@@ -135,8 +150,11 @@ func (e *Endpoint) Serve(appALPN string, h Handler, disc Discovery) error {
 			return h(ctx, &Conn{conn: ic}) // wrap: go-iroh is fenced here
 		}),
 	}
-	if gh, ok := gossipHandler(disc); ok {
-		handlers[gossip.ALPN] = gh
+	// Register gossip.ALPN whenever gossip is in play: a gossip Discovery, or a
+	// Subscribe that created the endpoint's gossip instance before Serve. Both
+	// share the one gossip handler.
+	if _, ok := disc.(*gossipDiscovery); ok || e.gossip != nil {
+		handlers[gossip.ALPN] = e.gossipProto().Handler()
 	}
 	r, err := iroh.NewRouter(e.ep, handlers, nil)
 	if err != nil {
@@ -217,6 +235,27 @@ func (e *Endpoint) LookupServices() *iroh.AddressLookupServices { return e.looku
 // leak, scoped to this module's own sub-packages; application code stays on the
 // fenced [Conn]/[Discovery] surface.
 func (e *Endpoint) Endpoint() *iroh.Endpoint { return e.ep }
+
+// gossipProto returns the endpoint's single gossip instance, created on first
+// use. Discovery and [Endpoint.Subscribe] share it so one router handler under
+// gossip.ALPN serves both.
+func (e *Endpoint) gossipProto() *gossip.Gossip {
+	e.gossipOnce.Do(func() { e.gossip = gossip.NewGossip(e.ep) })
+	return e.gossip
+}
+
+// Subscribe joins the gossip topic and returns it for signed publish/receive via
+// [PublishSigned] and [VerifiedEnvelopes]. bootstrap seeds the swarm. The topic
+// shares the endpoint's gossip instance, so [Endpoint.Serve] must register the
+// gossip ALPN (it does whenever a gossip Discovery or any Subscribe is in use).
+// The caller closes the returned topic.
+func (e *Endpoint) Subscribe(ctx context.Context, topic gossip.TopicID, bootstrap []netaddr.EndpointAddr) (*gossip.Topic, error) {
+	t, err := e.gossipProto().Subscribe(ctx, topic, bootstrap)
+	if err != nil {
+		return nil, fmt.Errorf("subscribe topic: %w", err)
+	}
+	return t, nil
+}
 
 // Close shuts the endpoint down. After Serve it routes through router.Shutdown,
 // which cancels the accept loop, runs handler Shutdown hooks, and closes the
