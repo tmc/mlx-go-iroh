@@ -1,0 +1,5 @@
+*.test
+/cover.out
+
+# Local Claude Code workflow/session artifacts
+/.claude/
