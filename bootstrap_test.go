@@ -110,39 +110,57 @@ func validBootstrap(t *testing.T) (string, key.EndpointID) {
 	return id.String() + "@ip:1.2.3.4:5678", id
 }
 
-// TestParseBootstrap checks one valid string parses to the expected id and a
-// dialable address, and that each malformed shape errors.
+// TestParseBootstrap covers the three accepted forms — a kind-prefixed transport
+// address, a bare host:port shorthand, and a bare global id — and the malformed
+// shapes that error.
 func TestParseBootstrap(t *testing.T) {
-	good, wantID := validBootstrap(t)
-
-	t.Run("valid", func(t *testing.T) {
-		addr, err := irohmesh.ParseBootstrap(good)
-		if err != nil {
-			t.Fatalf("ParseBootstrap(%q): %v", good, err)
-		}
-		if !addr.ID.Equal(wantID) {
-			t.Errorf("id = %s, want %s", addr.ID, wantID)
-		}
-		if len(addr.Addrs()) != 1 {
-			t.Fatalf("got %d transport addrs, want 1", len(addr.Addrs()))
-		}
-		if got := addr.Addrs()[0].String(); got != "ip:1.2.3.4:5678" {
-			t.Errorf("transport addr = %q, want %q", got, "ip:1.2.3.4:5678")
-		}
-	})
-
+	_, wantID := validBootstrap(t)
 	id := wantID.String()
-	tests := []struct {
+
+	valid := []struct {
+		name    string
+		in      string
+		wantTAs []string // expected transport-addr strings; empty for the bare-id form
+	}{
+		{"kind-prefixed ip", id + "@ip:1.2.3.4:5678", []string{"ip:1.2.3.4:5678"}},
+		{"bare host:port", id + "@1.2.3.4:5678", []string{"ip:1.2.3.4:5678"}},
+		{"bare id", id, nil},
+	}
+	for _, tt := range valid {
+		t.Run(tt.name, func(t *testing.T) {
+			addr, err := irohmesh.ParseBootstrap(tt.in)
+			if err != nil {
+				t.Fatalf("ParseBootstrap(%q): %v", tt.in, err)
+			}
+			if !addr.ID.Equal(wantID) {
+				t.Errorf("id = %s, want %s", addr.ID, wantID)
+			}
+			got := make([]string, len(addr.Addrs()))
+			for i, a := range addr.Addrs() {
+				got[i] = a.String()
+			}
+			if len(got) != len(tt.wantTAs) {
+				t.Fatalf("transport addrs = %v, want %v", got, tt.wantTAs)
+			}
+			for i := range got {
+				if got[i] != tt.wantTAs[i] {
+					t.Errorf("transport addr[%d] = %q, want %q", i, got[i], tt.wantTAs[i])
+				}
+			}
+		})
+	}
+
+	bad := []struct {
 		name string
 		in   string
 	}{
-		{"no at sign", id + "ip:1.2.3.4:5678"},
+		{"id run into addr no at sign", id + "ip:1.2.3.4:5678"}, // not a valid bare id either
 		{"bad endpoint id", "not-an-id@ip:1.2.3.4:5678"},
-		{"bad transport addr unknown kind", id + "@1.2.3.4:5678"},
+		{"unparseable transport addr", id + "@nonsense"},
 		{"empty transport addr", id + "@"},
 		{"empty", ""},
 	}
-	for _, tt := range tests {
+	for _, tt := range bad {
 		t.Run(tt.name, func(t *testing.T) {
 			if _, err := irohmesh.ParseBootstrap(tt.in); err == nil {
 				t.Errorf("ParseBootstrap(%q) = nil error, want error", tt.in)
