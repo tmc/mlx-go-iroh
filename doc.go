@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 // Package irohmesh is a transport substrate over [go-iroh]: the endpoint
 // bring-up, connection, discovery, and bootstrap ritual that every go-iroh mesh
 // consumer otherwise hand-rolls, plus the two primitives layered on top of it —

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 // Package manifest pulls a content-addressed set of blobs from peers over
 // go-iroh blobs, falling back to a central hub when no peer can serve one. It is
 // the generalized announce-then-pull path: a late joiner is handed a [Manifest]

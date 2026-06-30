@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 // Package blob is a content-addressed byte store over go-iroh blobs: hash some
 // bytes to get a [Hash], serve them to peers, and pull them back BAO-verified so
 // a corrupt or hostile peer cannot substitute different bytes. It carries no
