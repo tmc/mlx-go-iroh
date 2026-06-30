@@ -255,11 +255,20 @@ func (e *Endpoint) DialableAddr() netaddr.EndpointAddr {
 	return netaddr.NewEndpointAddr(e.ep.ID()).WithIP(e.ep.LocalAddr())
 }
 
+// TicketFromAddr mints an endpointticket for a raw id and IP address, without a
+// bound endpoint. It is the operator-tool and test form: code that knows a
+// peer's id and host:port but has no live [Endpoint] (for which [Endpoint.Ticket]
+// and [Endpoint.LocalTicket] mint from the endpoint's own id). The result is a
+// ticket a connector can dial without discovery.
+func TicketFromAddr(id key.EndpointID, addr netip.AddrPort) string {
+	return endpointticket.Encode(netaddr.NewEndpointAddr(id, netaddr.IPAddr{Addr: addr}))
+}
+
 // Ticket returns an endpointticket-encoded address for this endpoint at addr,
 // so a connector can dial it without discovery. Used to point one endpoint at
 // another on a known address (e.g. a loopback test or a seed list).
 func (e *Endpoint) Ticket(addr netip.AddrPort) string {
-	return endpointticket.Encode(netaddr.NewEndpointAddr(e.ep.ID(), netaddr.IPAddr{Addr: addr}))
+	return TicketFromAddr(e.ep.ID(), addr)
 }
 
 // LocalTicket returns the ticket for this endpoint at its actual bound local
