@@ -10,6 +10,15 @@ It depends only on go-iroh, `golang.org/x`, and the standard library. The
 `mlx-go` in the name marks the ecosystem family, not a dependency: there is no
 mlx-go import. A consumer pins go-iroh once, through this module.
 
+The root package is named `irohmesh`, not `mlx_go_iroh` — import the module
+path and refer to the package by its name:
+
+```go
+import "github.com/tmc/mlx-go-iroh"          // package irohmesh
+import "github.com/tmc/mlx-go-iroh/blob"     // package blob
+import "github.com/tmc/mlx-go-iroh/manifest" // package manifest
+```
+
 ## Packages
 
 | Package | What it provides |
