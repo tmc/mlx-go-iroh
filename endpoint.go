@@ -392,6 +392,11 @@ func (e *Endpoint) LookupServices() *iroh.AddressLookupServices { return e.looku
 // layers, which need it to open blob streams. It is the one deliberate seam
 // leak, scoped to this module's own sub-packages; application code stays on the
 // fenced [Conn]/[Discovery] surface.
+//
+// A consumer that runs its own accept loop on the raw endpoint (rather than
+// [Endpoint.Serve]) must register its ALPNs itself: [Bind] binds without any,
+// since Serve owns ALPN registration. Call ep.Endpoint().SetALPNs after Bind in
+// that case.
 func (e *Endpoint) Endpoint() *iroh.Endpoint { return e.ep }
 
 // gossipProto returns the endpoint's single gossip instance, created on first
